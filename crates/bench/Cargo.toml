@@ -1,0 +1,12 @@
+[package]
+name = "nats-bench"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+async-nats = "0.50"
+futures = "0.3"
+nats-test-harness.workspace = true
+tokio.workspace = true

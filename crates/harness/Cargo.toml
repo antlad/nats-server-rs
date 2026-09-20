@@ -1,0 +1,9 @@
+[package]
+name = "nats-test-harness"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

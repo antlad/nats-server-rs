@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/harness", "crates/core-it", "crates/bench"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+bytes = "1"
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
+nats-test-harness = { path = "crates/harness" }
