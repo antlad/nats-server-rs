@@ -1,0 +1,58 @@
+# load at start: 1.03 1.02 1.08 1/1061 3747393
+=== round 1 22:12:21 load=1.03 1.02 1.08 ===
+# server: nats://127.0.0.1:39167
+bench name=pubsub msgs=1000000 size=256 duration_ms=3286 msgs_per_sec=304319 mb_per_sec=74.30
+# server: nats://127.0.0.1:36073
+bench name=latency samples=20000 p50_us=636 p99_us=2719 p999_us=3256 max_us=4146
+# server: nats://127.0.0.1:41367
+bench name=fanout msgs=1000000 size=256 duration_ms=4560 msgs_per_sec=219318 mb_per_sec=53.54
+# delivered=1000000 subscribers=10
+=== round 2 22:12:45 load=1.85 1.19 1.14 ===
+# server: nats://127.0.0.1:44881
+bench name=pubsub msgs=1000000 size=256 duration_ms=4192 msgs_per_sec=238567 mb_per_sec=58.24
+# server: nats://127.0.0.1:39335
+bench name=latency samples=20000 p50_us=698 p99_us=2868 p999_us=3521 max_us=3979
+# server: nats://127.0.0.1:41213
+bench name=fanout msgs=1000000 size=256 duration_ms=4474 msgs_per_sec=223507 mb_per_sec=54.57
+# delivered=1000000 subscribers=10
+=== round 3 22:13:12 load=2.09 1.30 1.18 ===
+# server: nats://127.0.0.1:41665
+bench name=pubsub msgs=1000000 size=256 duration_ms=4539 msgs_per_sec=220334 mb_per_sec=53.79
+# server: nats://127.0.0.1:41543
+bench name=latency samples=20000 p50_us=490 p99_us=2753 p999_us=3619 max_us=4681
+# server: nats://127.0.0.1:39419
+bench name=fanout msgs=1000000 size=256 duration_ms=4504 msgs_per_sec=222009 mb_per_sec=54.20
+# delivered=1000000 subscribers=10
+=== round 4 22:13:36 load=2.55 1.46 1.23 ===
+# server: nats://127.0.0.1:38899
+bench name=pubsub msgs=1000000 size=256 duration_ms=5287 msgs_per_sec=189141 mb_per_sec=46.18
+# server: nats://127.0.0.1:42315
+bench name=latency samples=20000 p50_us=709 p99_us=2508 p999_us=3273 max_us=4309
+# server: nats://127.0.0.1:35585
+bench name=fanout msgs=1000000 size=256 duration_ms=4508 msgs_per_sec=221832 mb_per_sec=54.16
+# delivered=1000000 subscribers=10
+=== round 5 22:14:03 load=2.39 1.50 1.25 ===
+# server: nats://127.0.0.1:36411
+bench name=pubsub msgs=1000000 size=256 duration_ms=5388 msgs_per_sec=185591 mb_per_sec=45.31
+# server: nats://127.0.0.1:38713
+bench name=latency samples=20000 p50_us=1921 p99_us=3307 p999_us=3646 max_us=4213
+# server: nats://127.0.0.1:35353
+bench name=fanout msgs=1000000 size=256 duration_ms=4514 msgs_per_sec=221539 mb_per_sec=54.09
+# delivered=1000000 subscribers=10
+=== round 6 22:14:51 load=2.65 1.69 1.33 ===
+# server: nats://127.0.0.1:33871
+bench name=pubsub msgs=1000000 size=256 duration_ms=4556 msgs_per_sec=219471 mb_per_sec=53.58
+# server: nats://127.0.0.1:42469
+bench name=latency samples=20000 p50_us=900 p99_us=3222 p999_us=3783 max_us=4479
+# server: nats://127.0.0.1:36815
+bench name=fanout msgs=1000000 size=256 duration_ms=4513 msgs_per_sec=221574 mb_per_sec=54.10
+# delivered=1000000 subscribers=10
+=== round 7 22:15:27 load=2.80 1.81 1.38 ===
+# server: nats://127.0.0.1:37275
+bench name=pubsub msgs=1000000 size=256 duration_ms=6493 msgs_per_sec=154005 mb_per_sec=37.60
+# server: nats://127.0.0.1:40587
+bench name=latency samples=20000 p50_us=828 p99_us=2920 p999_us=3391 max_us=4396
+# server: nats://127.0.0.1:34157
+bench name=fanout msgs=1000000 size=256 duration_ms=4515 msgs_per_sec=221462 mb_per_sec=54.07
+# delivered=1000000 subscribers=10
+# load at end: 2.94 1.93 1.43 1/1066 3748464
