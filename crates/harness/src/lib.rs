@@ -19,17 +19,63 @@ pub struct Server {
     pub port: u16,
 }
 
+/// The single place where the binary under test is decided.
+///
+/// Kept separate from process spawning so both branches (set/unset) are testable
+/// without touching the real environment of the test process.
+pub fn resolve_bin(env_val: Option<String>) -> Result<String> {
+    match env_val {
+        Some(bin) if !bin.is_empty() => Ok(bin),
+        _ => bail!(
+            "NATS_SERVER_BIN is not set: point it at the nats-server binary under test"
+        ),
+    }
+}
+
 impl Server {
     /// Spawn the binary from $NATS_SERVER_BIN on a random loopback port.
     pub fn start() -> Result<Server> {
         Server::start_with_args(&[])
     }
 
-    /// Spawn with extra CLI args appended (e.g. ["--max_payload", "1024"]).
+    /// Spawn with extra CLI args appended.
+    ///
+    /// The reference binary has a deliberately small flag surface — everything
+    /// that is not `-a`/`-p`/`--ports_file_dir`/`-c` lives in the config file, so
+    /// tuning a server usually means [`Server::start_with_config`]. Passing a
+    /// flag the binary does not know makes it print usage and exit immediately
+    /// (measured against the Go reference: exit status 0, message on stderr),
+    /// which the readiness loop reports as `server exited early`.
+    ///
+    /// ```no_run
+    /// # use nats_test_harness::Server;
+    /// // -D turns on debug logging in both the Go and the Rust server.
+    /// let srv = Server::start_with_args(&["-D"]).unwrap();
+    /// ```
     pub fn start_with_args(extra_args: &[&str]) -> Result<Server> {
-        let bin = std::env::var("NATS_SERVER_BIN")
-            .context("NATS_SERVER_BIN is not set: point it at the nats-server binary under test")?;
+        Server::launch(extra_args, tempdir()?)
+    }
+
+    /// Spawn with a config file (written into the server's temp dir, kept alive
+    /// by the [`Server`] guard) passed via `-c`.
+    ///
+    /// This is the only way to move server options that the reference binary
+    /// does not expose as flags, e.g.
+    ///
+    /// ```no_run
+    /// # use nats_test_harness::Server;
+    /// let srv = Server::start_with_config("max_payload: 1024\n").unwrap();
+    /// ```
+    pub fn start_with_config(config: &str) -> Result<Server> {
         let dir = tempdir()?;
+        let path = dir.path().join("nats.conf");
+        std::fs::write(&path, config)?;
+        let cfg = path.display().to_string();
+        Server::launch(&["-c", cfg.as_str()], dir)
+    }
+
+    fn launch(extra_args: &[&str], dir: TempDir) -> Result<Server> {
+        let bin = resolve_bin(std::env::var("NATS_SERVER_BIN").ok())?;
         let mut cmd = Command::new(&bin);
         cmd.args(["-a", "127.0.0.1", "-p", "-1", "--ports_file_dir"])
             .arg(dir.path())
@@ -47,7 +93,14 @@ impl Server {
             host: "127.0.0.1".into(),
             port: 0,
         };
-        srv.wait_until_ready()?;
+        // Readiness can fail: the binary printed usage and exited, or bound
+        // nothing. Kill it either way, or a doomed child outlives the test and
+        // skews every run after it.
+        if let Err(e) = srv.wait_until_ready() {
+            let _ = srv.child.kill();
+            let _ = srv.child.wait();
+            return Err(e);
+        }
         Ok(srv)
     }
 

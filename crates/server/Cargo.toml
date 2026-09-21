@@ -1,0 +1,32 @@
+[package]
+name = "nats-server-rs"
+edition.workspace = true
+version.workspace = true
+
+# A library target as well as a binary: the protocol, subject and routing
+# internals are unit-tested in-process, which is the only place the promises
+# about ordering and the grammar can be checked exhaustively.
+[lib]
+name = "nats_server_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nats-server-rs"
+path = "src/main.rs"
+
+# Measurement only, never default: a global allocator that counts, plus a dump
+# on shutdown. See `specs/perf-notes.md` — the counters justify a claim that
+# `perf` cannot make on this host (kernel.perf_event_paranoid=4, no CAP_PERFMON).
+[features]
+default = []
+allocstats = []
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+
+[dev-dependencies]
+nats-test-harness.workspace = true
+tempfile.workspace = true

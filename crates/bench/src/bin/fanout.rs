@@ -4,8 +4,7 @@
 
 use bytes::Bytes;
 use futures::StreamExt;
-use nats_bench::{param, report};
-use nats_test_harness::Server;
+use nats_bench::{param, report, target};
 use std::time::{Duration, Instant};
 
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -15,13 +14,13 @@ async fn main() -> anyhow::Result<()> {
     let msgs = param("MSGS", 100_000);
     let size = param("SIZE", 256) as usize;
     let nsubs = param("SUBSCRIBERS", 10);
-    let srv = Server::start()?;
-    println!("# server: {}", srv.url);
+    let (_srv, addr) = target()?;
+    println!("# server: nats://{addr}");
 
-    let pub_nc = async_nats::connect(srv.client_addr()).await?;
+    let pub_nc = async_nats::connect(addr.clone()).await?;
     let mut subs = Vec::new();
     for _ in 0..nsubs {
-        let nc = async_nats::connect(srv.client_addr()).await?;
+        let nc = async_nats::connect(addr.clone()).await?;
         let sub = nc.subscribe("fan").await?;
         // Barrier: a request on the *subscriber's* connection round-trips
         // through the server, and because SUB and PUB share that connection the

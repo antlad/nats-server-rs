@@ -3,6 +3,12 @@ name = "core-it"
 edition.workspace = true
 version.workspace = true
 
+# The lib target is the shared raw-protocol helper the integration tests use;
+# it is not a library anyone else depends on.
+[dependencies]
+serde_json.workspace = true
+tokio.workspace = true
+
 [dev-dependencies]
 anyhow.workspace = true
 bytes.workspace = true

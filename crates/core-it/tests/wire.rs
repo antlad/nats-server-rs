@@ -258,3 +258,233 @@ async fn malformed_pub_closes_connection_without_err() {
         "malformed PUB must close without an -ERR line"
     );
 }
+
+// --------------------------------------------------------------------------------
+// Added in Part 2, Task 8: the INFO key set, pinned against the Go reference. The
+// tests above this line are Part 1's and are unchanged.
+
+/// The keys a core-only server must offer, and the ones it must not mention at
+/// all. Measured against the reference binary — see specs/protocol-contract.md.
+#[tokio::test]
+async fn info_key_set_is_pinned() {
+    let srv = Server::start().unwrap();
+    let (_s, info) = connect(&srv).await;
+    let obj = info.as_object().expect("INFO must be a JSON object");
+
+    // Required of every core server, whatever it is written in.
+    for key in [
+        "server_id",
+        "server_name",
+        "version",
+        "proto",
+        "host",
+        "port",
+        "headers",
+        "max_payload",
+    ] {
+        assert!(obj.contains_key(key), "INFO must carry {key}: {obj:?}");
+    }
+    assert_eq!(info["headers"].as_bool(), Some(true));
+
+    // Features this server does not have must be *absent*, not false or empty:
+    // clients branch on presence.
+    for key in [
+        "jetstream",
+        "connect_urls",
+        "cluster",
+        "cluster_name",
+        "domain",
+        "auth_required",
+        "tls_required",
+        "tls_available",
+        "nonce",
+        "ldm",
+        "compression",
+    ] {
+        assert!(
+            obj.get(key).is_none_or(|v| {
+                // The reference's own omitempty rule: a key may appear only with
+                // a non-default value. For these it must not appear at all.
+                let _ = v;
+                false
+            }),
+            "INFO must not mention {key}: {obj:?}"
+        );
+    }
+
+    // Implementation detail of the reference build (Go version, commit, x25519
+    // key, JetStream API level, per-connection ids). A Rust server may omit them;
+    // client.rs proves async-nats connects without them.
+    for key in [
+        "git_commit",
+        "go",
+        "api_lvl",
+        "xkey",
+        "client_id",
+        "client_ip",
+    ] {
+        if let Some(v) = obj.get(key) {
+            assert!(
+                !v.is_null(),
+                "{key} is omitempty in the reference: absent or a value, never null"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn info_is_a_single_line_in_the_documented_shape() {
+    let srv = Server::start().unwrap();
+    let mut s = TcpStream::connect(srv.client_addr()).await.unwrap();
+    let line = read_line(&mut s).await.expect("INFO");
+    // No CR or LF inside the JSON: one line, one protocol operation.
+    let body = &line[5..line.len() - 2];
+    assert!(!body.contains('\r') && !body.contains('\n'), "got {line:?}");
+    // The reference joins the parts with single spaces, which leaves one before
+    // the CR-LF (`generateInfoJSON`). Pinned as a shape, not as a byte trap.
+    assert!(
+        body.ends_with(' ') || body.ends_with('}'),
+        "INFO body must be JSON, optionally followed by the reference's \
+         join-space, got {body:?}"
+    );
+    let json = body.trim();
+    let parsed: serde_json::Value =
+        serde_json::from_str(json).expect("INFO must be one JSON object");
+    assert_eq!(parsed["proto"].as_u64(), Some(1));
+}
+
+#[tokio::test]
+async fn server_id_is_an_opaque_uppercase_token_equal_to_server_name() {
+    // Measured: the reference's server_id is 56 characters from the base32
+    // alphabet. It is not a NUID -- server.go uses the server's nkey public key
+    // ("CreateServer" -> PublicKey), so the shape is a property of nkeys. A core
+    // server with no auth has no key pair, and may emit any token of the same
+    // shape: nothing on the client side parses it.
+    let srv = Server::start().unwrap();
+    let (_s, info) = connect(&srv).await;
+    let id = info["server_id"].as_str().expect("server_id");
+    assert_eq!(
+        id.len(),
+        56,
+        "measured width of the reference id, got {id:?}"
+    );
+    assert!(
+        id.bytes()
+            .all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b)),
+        "base32 alphabet (A-Z, 2-7), got {id:?}"
+    );
+    assert_eq!(
+        info["server_name"].as_str(),
+        Some(id),
+        "an unconfigured server names itself by its id"
+    );
+    // A second connection sees the same server, and a different id per process
+    // run: nothing here may reuse one connection's INFO.
+    let (_s2, info2) = connect(&srv).await;
+    assert_eq!(
+        info2["server_id"].as_str(),
+        Some(id),
+        "server_id is per-server, not per-connection"
+    );
+}
+
+/// The config path (Task 8's harness addition) with a limit small enough that an
+/// oversized publish is cheap to send.
+#[tokio::test]
+async fn configured_max_payload_is_advertised_and_enforced() {
+    let srv = Server::start_with_config("max_payload: 1024\n").unwrap();
+    let (mut s, info) = connect(&srv).await;
+    assert_eq!(info["max_payload"].as_u64(), Some(1024));
+    write_all(&mut s, "CONNECT {\"verbose\":false}\r\n").await;
+
+    // Under the limit: silently fine.
+    write_all(&mut s, "PUB small 1000\r\n").await;
+    write_all(&mut s, &"x".repeat(1000)).await;
+    write_all(&mut s, "\r\n").await;
+    write_all(&mut s, "PING\r\n").await;
+    assert_eq!(read_line(&mut s).await.as_deref(), Some("PONG\r\n"));
+
+    write_all(&mut s, "PUB big 1025\r\n").await;
+    let line = read_line(&mut s).await.expect("-ERR line");
+    assert!(line.starts_with("-ERR"), "got {line:?}");
+    assert!(
+        line.contains("Maximum Payload Violation"),
+        "the reference names the violation, got {line:?}"
+    );
+    assert!(read_line(&mut s).await.is_none(), "then closes");
+}
+
+// --------------------------------------------------------------------------------
+// Ported from the reference's own Core suite (see specs/go-audit.md) where the
+// behaviour was previously only implied.
+
+/// Matching is token-wise: a literal subscription to `foo` does not cover
+/// `foo.bar` (`go:test/client_test.go:TestTwoTokenPubMatchSingleTokenSub`), and
+/// `foo.>` does not cover `foo` either.
+#[tokio::test]
+async fn literal_subscription_does_not_match_deeper_subjects() {
+    let srv = Server::start().unwrap();
+    let (mut sub, _) = connect(&srv).await;
+    write_all(
+        &mut sub,
+        "CONNECT {\"verbose\":false}\r\nSUB depth 1\r\nPING\r\n",
+    )
+    .await;
+    assert_eq!(read_line(&mut sub).await.as_deref(), Some("PONG\r\n"));
+
+    let (mut p, _) = connect(&srv).await;
+    write_all(
+        &mut p,
+        "CONNECT {\"verbose\":false}\r\nPUB depth.deeper 1\r\nx\r\nPING\r\n",
+    )
+    .await;
+    assert_eq!(
+        read_line(&mut p).await.as_deref(),
+        Some("PONG\r\n"),
+        "the publisher's barrier proves the PUB was processed"
+    );
+    // The subscriber's own PING, sent after the PUB was processed server-side,
+    // is the barrier: anything it should have received would have come first.
+    write_all(&mut sub, "PING\r\n").await;
+    assert_eq!(
+        read_line(&mut sub).await.as_deref(),
+        Some("PONG\r\n"),
+        "a deeper subject must not reach a one-token subscription"
+    );
+}
+
+/// A declared size that overflows the reference's parser (`parseSize` returns -1
+/// for anything over an int64) is a parse error: disconnect, no `-ERR`
+/// (`go:test/maxpayload_test.go:TestMaxPayloadOverrun`).
+#[tokio::test]
+async fn publish_size_that_overflows_int64_closes_without_err() {
+    let srv = Server::start().unwrap();
+    let (mut s, _) = connect(&srv).await;
+    write_all(
+        &mut s,
+        "CONNECT {\"verbose\":false}\r\nPUB foo 18446744073709551615123\r\n",
+    )
+    .await;
+    let line = read_line(&mut s).await;
+    assert!(
+        line.is_none() || line.unwrap().trim().is_empty(),
+        "an unparseable size must close without an -ERR line"
+    );
+}
+
+/// A size that is merely larger than `max_payload` but still a sane number gets
+/// the named error first (`max_payload_test.go:TestMaxPayload`), including the
+/// int32-range case the reference calls out.
+#[tokio::test]
+async fn publish_size_in_int32_range_over_limit_gets_err() {
+    let srv = Server::start().unwrap();
+    let (mut s, _) = connect(&srv).await;
+    write_all(
+        &mut s,
+        "CONNECT {\"verbose\":false}\r\nPUB foo 199380988\r\n",
+    )
+    .await;
+    let line = read_line(&mut s).await.expect("-ERR line");
+    assert!(line.starts_with("-ERR"), "got {line:?}");
+    assert!(read_line(&mut s).await.is_none(), "then close");
+}

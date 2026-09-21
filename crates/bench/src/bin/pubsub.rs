@@ -4,19 +4,18 @@
 
 use bytes::Bytes;
 use futures::StreamExt;
-use nats_bench::{param, report};
-use nats_test_harness::Server;
+use nats_bench::{param, report, target};
 use std::time::Instant;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let msgs = param("MSGS", 1_000_000);
     let size = param("SIZE", 256) as usize;
-    let srv = Server::start()?;
-    println!("# server: {}", srv.url);
+    let (_srv, addr) = target()?;
+    println!("# server: nats://{addr}");
 
-    let pub_nc = async_nats::connect(srv.client_addr()).await?;
-    let sub_nc = async_nats::connect(srv.client_addr()).await?;
+    let pub_nc = async_nats::connect(addr.clone()).await?;
+    let sub_nc = async_nats::connect(addr.clone()).await?;
     let mut sub = sub_nc.subscribe("bench").await?;
     sub_nc.flush().await?;
 

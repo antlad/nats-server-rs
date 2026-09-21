@@ -15,6 +15,26 @@ pub fn param(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// The server a bench runs against: one we spawn, or one that is already up.
+///
+/// `NATS_BENCH_URL` exists for measurement only. Attaching a profiler, a
+/// `strace`, or Go's `-m` pprof endpoint to a server that the bench spawns and
+/// reaps ten seconds later is not possible, so the counter/run-time numbers in
+/// `specs/perf-notes.md` were taken against a hand-started server on a fixed
+/// port. The load the server sees is the same: this changes nothing about the
+/// protocol path, the client, or the reported line. The canonical baseline
+/// protocol in `benchmarks/run_baseline.sh` never sets it.
+pub fn target() -> anyhow::Result<(Option<nats_test_harness::Server>, String)> {
+    match std::env::var("NATS_BENCH_URL") {
+        Ok(url) if !url.is_empty() => Ok((None, url)),
+        _ => {
+            let srv = nats_test_harness::Server::start()?;
+            let addr = srv.client_addr();
+            Ok((Some(srv), addr))
+        }
+    }
+}
+
 /// Print one stable, grep-able metric line per throughput bench.
 pub fn report(name: &str, msgs: u64, size: u64, dur: Duration) {
     let secs = dur.as_secs_f64();

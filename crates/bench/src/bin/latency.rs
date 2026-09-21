@@ -3,18 +3,17 @@
 //! Env: ITERS (default 20_000), WARMUP (default 1_000).
 
 use futures::StreamExt;
-use nats_bench::{param, report_latency};
-use nats_test_harness::Server;
+use nats_bench::{param, report_latency, target};
 use std::time::Instant;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let iters = param("ITERS", 20_000);
     let warmup = param("WARMUP", 1_000);
-    let srv = Server::start()?;
-    println!("# server: {}", srv.url);
+    let (_srv, addr) = target()?;
+    println!("# server: nats://{addr}");
 
-    let nc = async_nats::connect(srv.client_addr()).await?;
+    let nc = async_nats::connect(addr.clone()).await?;
     let mut sub = nc.subscribe("lat.echo").await?;
     let resp = nc.clone();
     tokio::spawn(async move {
