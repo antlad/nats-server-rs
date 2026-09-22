@@ -6,9 +6,9 @@
 //! The binary in `main.rs` is a thin shell around [`Server`]: flags, config, the
 //! ports file, signals. Everything the protocol tests assert lives here.
 
-#[cfg(feature = "allocstats")]
 pub mod allocstats;
 
+pub mod arena;
 pub mod client;
 pub mod config;
 pub mod info;

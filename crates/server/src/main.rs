@@ -73,8 +73,8 @@ async fn run() -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    #[cfg(feature = "allocstats")]
     nats_server_rs::allocstats::dump("start");
+    nats_server_rs::allocstats::spawn_dumper();
 
     let server = Server::new(cfg);
     let addr = bind(&server).await?;
@@ -94,7 +94,6 @@ async fn run() -> anyhow::Result<ExitCode> {
         _ = int.recv() => {}
     }
 
-    #[cfg(feature = "allocstats")]
     nats_server_rs::allocstats::dump("exit");
 
     remove_ports_file(&ports_file);

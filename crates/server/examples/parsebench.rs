@@ -50,9 +50,14 @@ fn main() {
     let msgs = run(&wire, frames, rounds, &lim);
     let dt = t.elapsed();
     println!(
-        "bench name=parsebench size={size} msgs={msgs} ns_per_msg={:.1} wire_bytes_per_msg={:.1}",
+        "bench name=parsebench size={size} msgs={msgs} ns_per_msg={:.1} wire_bytes_per_msg={:.1} event_bytes={} parser_bytes={}",
         dt.as_nanos() as f64 / msgs as f64,
         wire.len() as f64 / frames as f64,
+        // The two structures the cost is suspected to hide in: what one parsed
+        // operation costs to write into the batch, and what the state machine
+        // costs to move between its two states.
+        std::mem::size_of::<Event>(),
+        std::mem::size_of::<Parser>(),
     );
     #[cfg(feature = "allocstats")]
     {

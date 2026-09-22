@@ -166,6 +166,11 @@ struct Parts {
     first: Option<Bytes>,
     rest: Vec<Bytes>,
     got: usize,
+    /// True while the newest piece is still a *view* of the read buffer, i.e. it
+    /// was taken during the read that is currently being parsed. [`hoist`] clears
+    /// it, and that is what keeps a body spanning many reads from being copied
+    /// once per read.
+    fresh: bool,
 }
 
 impl Parts {
@@ -174,16 +179,35 @@ impl Parts {
             first: None,
             rest: Vec::new(),
             got: 0,
+            fresh: false,
         }
     }
 
     fn push(&mut self, b: Bytes) {
         self.got += b.len();
+        self.fresh = true;
         match self.first.take() {
             None => self.first = Some(b),
             Some(f) => {
                 self.rest.push(f);
                 self.rest.push(b);
+            }
+        }
+    }
+
+    /// Turn the piece taken during *this* read into bytes of its own, so the
+    /// buffer it was read into can be reused in place by the next one.
+    fn hoist(&mut self) {
+        if !self.fresh {
+            return;
+        }
+        self.fresh = false;
+        match self.rest.last_mut() {
+            Some(last) => own(last),
+            None => {
+                if let Some(first) = self.first.as_mut() {
+                    own(first);
+                }
             }
         }
     }
@@ -217,6 +241,41 @@ pub struct Parser {
 impl Default for Parser {
     fn default() -> Self {
         Parser::new()
+    }
+}
+
+/// Make a `Bytes` own its bytes. An empty one is already the shared static, and
+/// copying it would allocate for nothing.
+fn own(b: &mut Bytes) {
+    if !b.is_empty() {
+        *b = Bytes::copy_from_slice(&*b);
+    }
+}
+
+/// A frame left incomplete at the end of a read holds views of that read's buffer
+/// — its subject, its reply, and the piece of body taken so far. They have to be
+/// turned into owned bytes before the buffer is read into again, because
+/// `BytesMut::reserve` only reclaims an allocation in place while nothing else
+/// refers to it: with a view alive, the next read takes a *fresh* buffer of the
+/// whole capacity, and the reader pays an allocation and a copy per read instead
+/// of one per connection (`PLAN3.md` Task 23.3, `specs/perf-notes.md`).
+///
+/// Cost when it does happen: the subject and reply (both under a kilobyte), plus
+/// the body bytes taken during this read — never the whole body again, which is
+/// what `Parts::fresh` remembers.
+fn hoist(state: &mut State) {
+    if let State::Body {
+        subject,
+        reply,
+        parts,
+        ..
+    } = state
+    {
+        own(subject);
+        if let Some(reply) = reply {
+            own(reply);
+        }
+        parts.hoist();
     }
 }
 
@@ -321,6 +380,7 @@ impl Parser {
                         parts.push(src.split_to(take).freeze());
                     }
                     if parts.got < *need {
+                        hoist(&mut self.state);
                         return Ok(());
                     }
                     // The terminator is positional, and the reference decides on
@@ -332,13 +392,19 @@ impl Parser {
                     // An HPUB is the exception: there the capability question is
                     // asked before any of this, so the failure is deferred.
                     match src.first() {
-                        None => return Ok(()),
+                        None => {
+                            hoist(&mut self.state);
+                            return Ok(());
+                        }
                         Some(b'\r') if src.len() >= 2 => {
                             if src[1] != b'\n' {
                                 return hpub_frame_error(*hpub, out);
                             }
                         }
-                        Some(b'\r') => return Ok(()),
+                        Some(b'\r') => {
+                            hoist(&mut self.state);
+                            return Ok(());
+                        }
                         Some(_) => return hpub_frame_error(*hpub, out),
                     }
                     src.advance(2);
@@ -563,6 +629,7 @@ fn pub_line(
 /// in-place reuse — for the life of that connection. A publish's subject is a
 /// view, because it is finished with before the next read.
 fn subscribe(subject: &[u8], queue: Option<&[u8]>, sid: &[u8]) -> Event {
+    crate::allocstats::tag(crate::allocstats::Site::Subscribe);
     Event::Subscribe {
         subject: Bytes::copy_from_slice(subject),
         queue: queue.map(Bytes::copy_from_slice),

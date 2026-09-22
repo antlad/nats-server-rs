@@ -56,7 +56,20 @@ run_arm () { # $1 = label, $2 = binary
   done
   kill -0 "$pid" 2>/dev/null || { echo "# $label: server died (port busy?)" >> "$OUT"; return 1; }
   t0=$(cpu_ticks "$pid")
-  if [ "$MODE" = pubsub ]; then
+  if [ "$MODE" = floodpubsub ]; then
+    MSGS="$MSGS" SIZE="$SIZE" ADDR="$HOST:$PORT" STALL_SECS=15 \
+      ${CLIENT_PIN:+taskset -c "$CLIENT_PIN"} ./target/release/floodpubsub >/tmp/three-bench.txt 2>&1 &
+    local bp=$!
+    peak=0
+    while kill -0 $bp 2>/dev/null; do v=$(rss_kb "$pid"); peak=$(( v > peak ? v : peak )); sleep 0.05; done
+    wait $bp
+    rate=$(grep -oE 'msgs_per_sec=[0-9]+' /tmp/three-bench.txt | tail -1 | cut -d= -f2)
+    # The divisor is what was *delivered*: at flood rates a few thousand of the
+    # last messages are never counted, on either binary, and CPU per delivered
+    # message has to be attributed over the messages that were delivered.
+    dm=$(grep -oE 'name=floodpubsub msgs=[0-9]+' /tmp/three-bench.txt | tail -1 | grep -oE '[0-9]+$')
+    [ -n "$dm" ] && MSGS="$dm"
+  elif [ "$MODE" = pubsub ]; then
     MSGS="$MSGS" SIZE="$SIZE" NATS_BENCH_URL="nats://$HOST:$PORT" \
       ${CLIENT_PIN:+taskset -c "$CLIENT_PIN"} ./target/release/pubsub >/tmp/three-bench.txt 2>&1 &
     local bp=$!

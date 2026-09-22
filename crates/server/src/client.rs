@@ -20,37 +20,34 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Notify};
 
+use crate::allocstats::{tag, Site};
+use crate::arena::Arena;
 use crate::config::Config;
 use crate::proto::{self, Event, Limits, Parser};
-use crate::routing::{Msg, Sub};
+use crate::routing::{self, Msg, Sub};
 use crate::Server;
 
-/// A piece of the outbound queue: control-line bytes, an optional shared payload,
-/// and the frame's trailing CRLF.
-pub struct Frame {
-    pub head: Bytes,
-    pub body: Option<Bytes>,
-    pub tail: Bytes,
-}
-
-/// The frame terminator, shared by every message frame.
-pub const CRLF: &[u8] = b"\r\n";
+/// One frame: everything the writer must put on the wire for one server
+/// statement, laid out contiguously in one buffer.
+///
+/// It used to be three parts (`head`, `body`, `tail`) because the head was built
+/// on the publishing task and the payload was copied on its own. Contiguity is
+/// what lets a delivery cost one memcpy and one `write` instead of two
+/// allocations and a three-buffer iovec, and it is why `Frame` is a newtype now
+/// — see [`crate::arena`] for where the bytes come from.
+#[derive(Clone)]
+pub struct Frame(pub Bytes);
 
 impl Frame {
     /// A line the server says about a command: it carries its own CRLF.
     pub fn line(bytes: impl Into<Bytes>) -> Frame {
-        let head = bytes.into();
-        Frame {
-            head,
-            body: None,
-            tail: Bytes::from_static(&[]),
-        }
+        Frame(bytes.into())
     }
 
     pub fn ok() -> Frame {
@@ -58,6 +55,7 @@ impl Frame {
     }
 
     pub fn err(text: &str) -> Frame {
+        tag(Site::ControlLine);
         Frame::line(Bytes::from(format!("-ERR '{text}'\r\n")))
     }
 
@@ -70,25 +68,20 @@ impl Frame {
     }
 
     fn len(&self) -> usize {
-        self.head.len() + self.body.as_ref().map(|b| b.len()).unwrap_or(0) + self.tail.len()
+        self.0.len()
     }
 
-    /// Hand this frame's buffers to the writer's list, in order, by moving them:
-    /// returning a fresh `Vec<Bytes>` (and cloning into it) was one allocation
-    /// per frame per subscriber, which is a cost paid on every delivery.
+    /// Hand this frame's buffer to the writer's list, by moving it.
     fn write_into(self, dst: &mut VecDeque<Bytes>) {
-        let Frame { head, body, tail } = self;
-        if !head.is_empty() {
-            dst.push_back(head);
-        }
-        if let Some(b) = body {
-            dst.push_back(b);
-        }
-        if !tail.is_empty() {
-            dst.push_back(tail);
+        if !self.0.is_empty() {
+            dst.push_back(self.0);
         }
     }
 }
+
+/// The frame terminator. `build_frame` writes it *into* the frame; it is not a
+/// third buffer for the kernel to be told about.
+pub const CRLF: &[u8] = b"\r\n";
 
 /// The outcome of queueing a frame for a subscriber.
 #[derive(Debug, PartialEq, Eq)]
@@ -183,9 +176,20 @@ impl Options {
     }
 }
 
+/// The queue's own half of an outbox: the sender, and the arena that every frame
+/// queued through it is laid out in.
+///
+/// They share one lock deliberately. Frames must be *laid down* in the order the
+/// writer will drain them — that is the arena's recycling rule, which is the
+/// ordering promise restated — and the queue lock is where that order is decided.
+struct Sender {
+    tx: mpsc::UnboundedSender<Frame>,
+    arena: Arena,
+}
+
 /// Outbound queue for one connection.
 pub struct Outbox {
-    tx: Mutex<Option<mpsc::UnboundedSender<Frame>>>,
+    tx: Mutex<Option<Sender>>,
     rx: Mutex<Option<mpsc::UnboundedReceiver<Frame>>>,
     pub pending: AtomicUsize,
     soft: usize,
@@ -198,12 +202,36 @@ pub struct Outbox {
     gone: AtomicBool,
 }
 
+/// Account for `frame` and hand it to the writer. The queue lock is held by the
+/// caller: `pending` is only compared against the limits consistently while
+/// nobody else can be queuing.
+fn push(sender: &mut Sender, out: &Outbox, frame: Frame) -> Enqueue {
+    let len = frame.len();
+    let before = out.pending.fetch_add(len, Ordering::AcqRel) + len;
+    if before > out.hard {
+        out.pending.fetch_sub(len, Ordering::AcqRel);
+        return Enqueue::SlowConsumer;
+    }
+    if sender.tx.send(frame).is_err() {
+        out.pending.fetch_sub(len, Ordering::AcqRel);
+        return Enqueue::Dropped;
+    }
+    if before > out.soft {
+        Enqueue::SoftLimit
+    } else {
+        Enqueue::Ok
+    }
+}
+
 impl Outbox {
     fn new(cfg: &Config) -> Arc<Outbox> {
         let (tx, rx) = mpsc::unbounded_channel();
         let hard = cfg.max_pending as usize;
         Arc::new(Outbox {
-            tx: Mutex::new(Some(tx)),
+            tx: Mutex::new(Some(Sender {
+                tx,
+                arena: Arena::new(),
+            })),
             rx: Mutex::new(Some(rx)),
             pending: AtomicUsize::new(0),
             // 75 %: `c.out.mp/4*3` in the reference (`go:client.go:2654`).
@@ -219,26 +247,28 @@ impl Outbox {
     }
 
     fn enqueue(self: &Arc<Outbox>, frame: Frame) -> Enqueue {
-        let len = frame.len();
-        let guard = self.tx.lock().unwrap();
-        let tx = match guard.as_ref() {
-            Some(tx) => tx,
+        let mut guard = self.tx.lock().unwrap();
+        match guard.as_mut() {
+            Some(sender) => push(sender, self, frame),
+            None => Enqueue::Dropped,
+        }
+    }
+
+    /// Queue a delivery. `build` lays the frame out in this connection's arena
+    /// and is called with the queue lock held, so the frames in a chunk are in
+    /// exactly the order the writer will hand them to the kernel — and a
+    /// connection that is already gone costs the call, not the bytes.
+    fn queue_with(
+        self: &Arc<Outbox>,
+        build: impl FnOnce(&mut Arena) -> Frame,
+    ) -> Enqueue {
+        let mut guard = self.tx.lock().unwrap();
+        let sender = match guard.as_mut() {
+            Some(sender) => sender,
             None => return Enqueue::Dropped,
         };
-        let before = self.pending.fetch_add(len, Ordering::AcqRel) + len;
-        if before > self.hard {
-            self.pending.fetch_sub(len, Ordering::AcqRel);
-            return Enqueue::SlowConsumer;
-        }
-        if tx.send(frame).is_err() {
-            self.pending.fetch_sub(len, Ordering::AcqRel);
-            return Enqueue::Dropped;
-        }
-        if before > self.soft {
-            Enqueue::SoftLimit
-        } else {
-            Enqueue::Ok
-        }
+        let frame = build(&mut sender.arena);
+        push(sender, self, frame)
     }
 
     fn drained(&self, bytes: usize) {
@@ -349,6 +379,17 @@ impl Conn {
         self.out.enqueue(frame)
     }
 
+    /// Queue one subscriber's copy of one message. The frame is built into this
+    /// connection's arena, so a delivery is one memcpy and no allocation, and the
+    /// `sub`/`msg` bytes are only ever read — nothing here outlives the call.
+    pub fn deliver(&self, sub: &Sub, msg: &Msg<'_>) -> Enqueue {
+        if self.is_closed() {
+            return Enqueue::Dropped;
+        }
+        self.out
+            .queue_with(|arena| routing::build_frame(arena, sub, msg))
+    }
+
     /// Say nothing and hang up: that is what the reference does to a subscriber
     /// whose buffer filled (contract §7).
     pub fn close_slow_consumer(&self) {
@@ -416,6 +457,7 @@ pub async fn spawn(server: Arc<Server>, socket: TcpStream, cid: u64) {
     let (read, write) = socket.into_split();
     let out = Outbox::new(&server.cfg);
 
+    tag(Site::Connection);
     let conn = Arc::new_cyclic(|me: &Weak<Conn>| Conn {
         cid,
         peer,
@@ -484,10 +526,17 @@ const SHORTS_TO_SHRINK: u32 = 2;
 async fn read_loop(server: Arc<Server>, conn: Arc<Conn>, mut read: OwnedReadHalf) {
     let mut cap = START_READ_BUF;
     let mut short = 0u32;
+    tag(Site::ReadBuf);
     let mut buf = BytesMut::with_capacity(cap);
     // The batch this read produced. Reused, so a connection's events live in the
     // same pages read after read (`proto::Parser::feed_into`).
     let mut events: Vec<Event> = Vec::new();
+    // What the last publish's subject resolved to, and where the connections
+    // worth waiting for go. Both belong to this task, both keep their capacity
+    // for the life of the connection, and together they are why a publish costs no
+    // allocation and no registry lock once the subject has been seen once.
+    let mut interest = routing::Interest::new();
+    let mut stall: Vec<Arc<Conn>> = Vec::new();
     let mut parser = Parser::new();
     // The first probe is short whatever is configured; afterwards, the interval.
     let first = keepalive_first(server.cfg.ping_interval);
@@ -501,12 +550,21 @@ async fn read_loop(server: Arc<Server>, conn: Arc<Conn>, mut read: OwnedReadHalf
         if conn.is_closed() {
             break;
         }
-        if buf.remaining_mut() < cap {
+        // Same trap as the arena: `BytesMut` answers `BufMut::remaining_mut`
+        // with `usize::MAX - len`, so "is there room" is always yes, `reserve` is
+        // never called, and the growth Part 2 measured as change 7 happens instead
+        // inside `chunk_mut`, one implicit 64-byte reservation at a time. The real
+        // question is capacity left over what is still in the buffer.
+        if buf.capacity() - buf.len() < cap {
+            // Only a real allocation if `reserve` could not reclaim in place —
+            // which needs every view of the old buffer to be dead, and the
+            // straddling frame's are not (Task 23.3).
+            tag(Site::ReadBuf);
             // `reserve` reuses the allocation in place when nothing still holds a
             // view of it, which — with the batch's views dropped below — is the
             // normal case: the reader's buffer is then one allocation for the
             // life of the connection.
-            buf.reserve(cap - buf.remaining_mut());
+            buf.reserve(cap - (buf.capacity() - buf.len()));
         }
         let step = tokio::select! {
             r = read.read_buf(&mut buf) => Some(r),
@@ -546,7 +604,8 @@ async fn read_loop(server: Arc<Server>, conn: Arc<Conn>, mut read: OwnedReadHalf
                 short = 0;
                 cap /= 2;
                 if buf.is_empty() {
-                    buf = BytesMut::with_capacity(cap);
+                    tag(Site::ReadBuf);
+                buf = BytesMut::with_capacity(cap);
                 }
             }
         }
@@ -557,6 +616,9 @@ async fn read_loop(server: Arc<Server>, conn: Arc<Conn>, mut read: OwnedReadHalf
         // reference's "the connection is gone, say this one thing" class, and
         // what the earlier commands did before the close is measured parity
         // (`specs/parity-log.md`), so the batch is not dispatched as it fills.
+        if events.capacity() <= events.len() {
+            tag(Site::Events);
+        }
         events.clear();
         if let Err(err) = parser.feed_into(&mut buf, &lim, &mut events) {
             if let Some(text) = err.err_line() {
@@ -570,7 +632,7 @@ async fn read_loop(server: Arc<Server>, conn: Arc<Conn>, mut read: OwnedReadHalf
             continue;
         }
         for ev in events.drain(..) {
-            if !handle(&server, &conn, ev).await {
+            if !handle(&server, &conn, ev, &mut interest, &mut stall).await {
                 conn.close("connection closed by protocol");
                 return;
             }
@@ -596,7 +658,17 @@ fn limits_of(server: &Server) -> Limits {
 
 /// Process one parsed operation. Returns false when the connection must go away
 /// with no further words — the class-C path, decided in one place.
-async fn handle(server: &Arc<Server>, conn: &Arc<Conn>, ev: Event) -> bool {
+///
+/// `interest` and `stall` are the reader task's, threaded down to the router: the
+/// alternative — a `Vec` built per message to hold the answer — is the allocation
+/// the delivery gate is about.
+async fn handle(
+    server: &Arc<Server>,
+    conn: &Arc<Conn>,
+    ev: Event,
+    interest: &mut routing::Interest,
+    stall: &mut Vec<Arc<Conn>>,
+) -> bool {
     let verbose = conn.opts().verbose;
     match ev {
         Event::Connect(json) => {
@@ -687,7 +759,7 @@ async fn handle(server: &Arc<Server>, conn: &Arc<Conn>, ev: Event) -> bool {
                 hdr,
                 body: &body,
             };
-            let outcome = server.registry.route(&msg, conn);
+            let outcome = server.registry.route(&msg, conn, interest, stall);
             server.no_responder_check(conn, &msg, reply.as_deref(), outcome.count);
             for stalled in outcome.stall {
                 // The publisher waits for room on the subscriber it overflowed,
@@ -753,8 +825,19 @@ async fn handle(server: &Arc<Server>, conn: &Arc<Conn>, ev: Event) -> bool {
 const MAX_BATCH_BYTES: usize = 256 * 1024;
 
 /// Never hand the kernel more buffers than `IOV_MAX`: above it `writev` fails
-/// with EINVAL, so this is the real ceiling on a batch of small frames.
+/// with EINVAL, so this is the real ceiling on a batch. A frame is one buffer
+/// now, so at 256 B payloads the byte cap is what a full batch runs into first.
 const MAX_BATCH_PARTS: usize = 1000;
+
+/// Buffers a batch of this size or smaller is described to the kernel from the
+/// stack.
+///
+/// The point is the common case: a writer that wakes up to find exactly one
+/// message waiting gets a plain `write`, no iovec array and no allocation, and
+/// one message at a time is what a network that is not saturated looks like. The
+/// array covers a burst of a few dozen, and past that the batch is large enough
+/// that one `Vec` per *batch* — not per message — is what the kernel wants anyway.
+const STACK_IOV: usize = 32;
 
 async fn write_loop(out: Arc<Outbox>, mut write: OwnedWriteHalf, conn: Arc<Conn>) {
     let mut rx = match out.take_rx() {
@@ -764,6 +847,11 @@ async fn write_loop(out: Arc<Outbox>, mut write: OwnedWriteHalf, conn: Arc<Conn>
     let deadline = conn.server.cfg.write_deadline;
     let mut parts: VecDeque<Bytes> = VecDeque::new();
     let mut batch_bytes = 0usize;
+    // One timer for the life of the writer, re-armed per attempt. Building the
+    // deadline with `tokio::time::timeout` allocates a `Sleep` and inserts a new
+    // entry in the timer wheel *for every write attempt*, which at one message per
+    // attempt is one allocation per delivered message (`specs/perf-notes.md`).
+    let mut timer = Box::pin(tokio::time::sleep(Duration::ZERO));
 
     loop {
         if parts.is_empty() {
@@ -802,9 +890,13 @@ async fn write_loop(out: Arc<Outbox>, mut write: OwnedWriteHalf, conn: Arc<Conn>
                 out.drained(batch_bytes);
                 return;
             }
-            let slices: Vec<_> = parts.iter().map(|p| std::io::IoSlice::new(p)).collect();
+            timer
+                .as_mut()
+                .reset(tokio::time::Instant::now() + deadline);
             let written = tokio::select! {
-                r = tokio::time::timeout(deadline, write.write_vectored(&slices)) => r,
+                biased;
+                r = write_batch(&mut write, &mut parts) => r,
+                _ = timer.as_mut() => Err(error_at_deadline()),
                 _ = conn.wake.notified() => {
                     if hard_closed(&conn) {
                         out.drained(batch_bytes);
@@ -814,25 +906,25 @@ async fn write_loop(out: Arc<Outbox>, mut write: OwnedWriteHalf, conn: Arc<Conn>
                 }
             };
             match written {
-                Err(_) => {
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                     // The write deadline is how the reference notices a socket
                     // that stopped taking data.
                     out.drained(batch_bytes);
                     conn.close_now("write deadline exceeded");
                     return;
                 }
-                Ok(Ok(0)) => {
+                Ok(0) => {
                     out.drained(batch_bytes);
                     conn.close("socket stopped accepting data");
                     return;
                 }
-                Ok(Ok(n)) => {
+                Ok(n) => {
                     consume(&mut parts, n);
                     batch_bytes -= n;
                     out.drained(n);
                 }
-                Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Ok(Err(e)) => {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
                     out.drained(batch_bytes);
                     conn.close(format!("write error: {e}"));
                     return;
@@ -842,6 +934,56 @@ async fn write_loop(out: Arc<Outbox>, mut write: OwnedWriteHalf, conn: Arc<Conn>
         parts.clear();
     }
     conn.close("written");
+}
+
+/// The deadline as an error, so that one `select!` can tell "the socket stopped
+/// taking data" from "the socket broke" by its kind.
+fn error_at_deadline() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, "write deadline exceeded")
+}
+
+/// One write attempt over the whole batch, in the cheapest shape that describes
+/// it: `write` for a single frame, a stack array of iovecs for a small batch, a
+/// `Vec` of them for a big one.
+async fn write_batch(write: &mut OwnedWriteHalf, parts: &mut VecDeque<Bytes>) -> std::io::Result<usize> {
+    match parts.len() {
+        0 => Ok(0),
+        // The one-message-at-a-time case, and the one that must not allocate:
+        // take the buffer out of the queue for the duration of the call, and put
+        // back only what the kernel did not take.
+        1 => {
+            let mut buf = parts.pop_front().expect("one buffer");
+            match write.write(&buf).await {
+                Ok(n) if n < buf.len() => {
+                    buf.advance(n);
+                    parts.push_front(buf);
+                    Ok(n)
+                }
+                r => {
+                    if r.is_err() {
+                        parts.push_front(buf);
+                    }
+                    r
+                }
+            }
+        }
+        n if n <= STACK_IOV => {
+            // `Bytes::default()` is the empty buffer, and an empty iovec is a
+            // no-op to `writev`, so padding a short batch out to a fixed array
+            // costs nothing but the stack.
+            let slots: [Bytes; STACK_IOV] = std::array::from_fn(|i| {
+                parts.get(i).cloned().unwrap_or_default()
+            });
+            let iov: [std::io::IoSlice; STACK_IOV] =
+                std::array::from_fn(|i| std::io::IoSlice::new(&slots[i]));
+            write.write_vectored(&iov[..n]).await
+        }
+        _ => {
+            let slices: Vec<std::io::IoSlice> =
+                parts.iter().map(|b| std::io::IoSlice::new(b)).collect();
+            write.write_vectored(&slices).await
+        }
+    }
 }
 
 /// Drop `n` bytes from the front of `parts`, splitting the buffer that ends

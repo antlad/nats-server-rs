@@ -7,15 +7,17 @@ default), so the honest memory figure for this shape is ~64 MiB plus frames in
 flight — and the honest failure mode is a server holding *far* more, because a
 delivered payload pins the buffer it was read into.
 
-Deliveries in this server copy the payload once (routing.rs, `route`) instead of
-handing out a view of the publisher's read buffer, and this is the measurement
-that says so. Both binaries run the same way:
+Deliveries in this server copy the payload once — into the subscriber's own frame
+arena (`arena.rs`, laid down by `routing::build_frame`) — instead of handing out a
+view of the publisher's read buffer, and this is the measurement that says so.
+Because a chunk belongs to one connection, a wedged subscriber pins its own bytes
+and nothing else: 1.00x max_pending as of 2026-09-22, against the reference's 1.98x. Both binaries run the same way:
 
     python3 specs/tools/memprobe.py /home/vlad/apps/nats-server 3000000
     python3 specs/tools/memprobe.py target/release/nats-server-rs 3000000
 
-Recorded 2026-09-22 (3 M messages of 128 B, aarch64): Go 127.8 MiB peak RSS, ours
-124.5 MiB — 1.95x `max_pending` each, no chunk amplification in either.
+Recorded 2026-09-22 (3 M messages of 128 B, aarch64, after Task 25): Go 126.7 MiB
+peak RSS = 1.98x, ours 63.8 MiB = 1.00x.
 """
 import os, signal, socket, subprocess, sys, time
 
