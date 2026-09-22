@@ -14,8 +14,9 @@
 //! the measured cost of the scan.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bytes::Bytes;
 
@@ -82,13 +83,20 @@ impl Sub {
     }
 }
 
-/// A message on its way from a publisher to the registry.
-pub struct Msg {
-    pub subject: Bytes,
-    pub reply: Option<Bytes>,
+/// A message on its way from a publisher to the registry, borrowed from the
+/// publish event.
+///
+/// Routing needs to *look* at these bytes, not own them: the only publisher
+/// worth its throughput spends one pass over the wire and none on the payload,
+/// and a message nobody subscribes to to goes no further than the batch it was
+/// parsed into. `route` copies the body exactly once, and only when somebody is
+/// actually going to write it — see [`Registry::route`].
+pub struct Msg<'a> {
+    pub subject: &'a [u8],
+    pub reply: Option<&'a [u8]>,
     /// Header-block length within `body`.
     pub hdr: usize,
-    pub body: Bytes,
+    pub body: &'a Bytes,
 }
 
 /// What one route call produced.
@@ -100,8 +108,72 @@ pub struct Delivered {
     pub stall: Vec<Arc<Conn>>,
 }
 
+/// The subject map's hasher: one multiply-xor per 8 bytes of subject, seeded
+/// once per process.
+///
+/// The standard `SipHash-1-3` is designed to survive a hostile key, and a
+/// publisher pays 15–20 ns for that on *every message* — at the reference's
+/// rate, most of the difference between "found no interest" and "found no
+/// interest quickly" (`specs/perf-notes.md`). The seed keeps the map from being
+/// an easy target for a client that chooses its own subjects, and equality is
+/// untouched: this only decides which bucket a subject lands in.
+#[derive(Clone, Copy)]
+struct SubjectHasher(u64);
+
+impl Default for SubjectHasher {
+    #[inline]
+    fn default() -> SubjectHasher {
+        SubjectHasher(hash_seed())
+    }
+}
+
+/// Not `RandomState` itself — that one is SipHash — but seeded the same way, so
+/// two processes disagree about bucket order and a client cannot probe its way
+/// into a collision.
+fn hash_seed() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    static SEED: OnceLock<u64> = OnceLock::new();
+    *SEED.get_or_init(|| RandomState::new().build_hasher().finish())
+}
+
+impl SubjectHasher {
+    #[inline]
+    fn mix(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(11) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl Hasher for SubjectHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut b = bytes;
+        while b.len() >= 8 {
+            self.mix(u64::from_le_bytes(b[..8].try_into().unwrap()));
+            b = &b[8..];
+        }
+        if !b.is_empty() {
+            let mut w = [0u8; 8];
+            w[..b.len()].copy_from_slice(b);
+            // The length goes in with the tail so `foo` and `foo\0` differ.
+            self.mix(u64::from_le_bytes(w) ^ (bytes.len() as u64) << 56);
+        }
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        // Final avalanche: cheap, and it spreads the high buckets, which is what
+        // the low bits of a short subject would otherwise not do.
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb) ^ (z >> 31)
+    }
+}
+
+type SubjectMap = HashMap<Bytes, Vec<Arc<Sub>>, BuildHasherDefault<SubjectHasher>>;
+
 struct Inner {
-    literal: HashMap<Bytes, Vec<Arc<Sub>>>,
+    literal: SubjectMap,
     wildcard: Vec<Arc<Sub>>,
     /// Counting subscriptions makes the 503 check cheap and exact.
     total: usize,
@@ -116,7 +188,7 @@ impl Default for Registry {
     fn default() -> Self {
         Registry {
             inner: Mutex::new(Inner {
-                literal: HashMap::new(),
+                literal: SubjectMap::default(),
                 wildcard: Vec::new(),
                 total: 0,
             }),
@@ -129,7 +201,7 @@ impl Registry {
     pub fn new() -> Arc<Registry> {
         Arc::new(Registry {
             inner: Mutex::new(Inner {
-                literal: HashMap::new(),
+                literal: SubjectMap::default(),
                 wildcard: Vec::new(),
                 total: 0,
             }),
@@ -205,7 +277,7 @@ impl Registry {
 
     /// Fan a message out. Returns who received it and which subscribers the
     /// publisher should wait for.
-    pub fn route(&self, msg: &Msg, from: &Arc<Conn>) -> Delivered {
+    pub fn route<'a>(&self, msg: &Msg<'a>, from: &Arc<Conn>) -> Delivered {
         let mut stall = Vec::new();
         let mut count = 0usize;
         let mut expired: Vec<Arc<Sub>> = Vec::new();
@@ -214,7 +286,6 @@ impl Registry {
         // queue groups, collected under the registry lock.
         let (plain, groups, start) = {
             let inner = self.inner.lock().unwrap();
-            let start = self.rng.lock().unwrap().next_u64();
             let mut plain: Vec<Arc<Sub>> = Vec::new();
             let mut groups: Vec<(Option<Bytes>, Vec<Arc<Sub>>)> = Vec::new();
             let mut consider = |sub: &Arc<Sub>| match &sub.queue {
@@ -237,14 +308,43 @@ impl Registry {
                     consider(sub);
                 }
             }
+            // The reference picks a random start index per message so that a
+            // queue group stays even without a shared counter to serialise. With
+            // no queue group in the batch there is nothing to be even about, and
+            // asking used to take a process-wide lock on every message.
+            let start = if groups.is_empty() {
+                0
+            } else {
+                self.rng.lock().unwrap().next_u64()
+            };
             (plain, groups, start)
+        };
+
+        if plain.is_empty() && groups.is_empty() {
+            // No interest, short circuit if so — the reference's own comment for
+            // this branch (`go:client.go:4506`), and the reason a publish to a
+            // subject nobody watches costs it one hash and no copies. The payload
+            // stays a view of the read buffer and dies with the batch.
+            return Delivered { count, stall };
+        }
+
+        // Somebody will write these bytes, and the buffer they sit in is about to
+        // be the publisher's next read. Take one owned copy here, so every frame
+        // below can share it and no 64 KiB chunk ends outliving a slow consumer
+        // by holding one pending message hostage.
+        let body = Bytes::copy_from_slice(msg.body);
+        let owned = Msg {
+            subject: msg.subject,
+            reply: msg.reply,
+            hdr: msg.hdr,
+            body: &body,
         };
 
         for sub in &plain {
             if !sub.eligible(from) {
                 continue;
             }
-            match self.give(sub, msg, &mut expired) {
+            match self.give(sub, &owned, &mut expired) {
                 Give::Ok => count += 1,
                 Give::Stall(c) => {
                     count += 1;
@@ -274,7 +374,7 @@ impl Registry {
                 });
             let Some(sub) = pick else { continue };
             {
-                match self.give(sub, msg, &mut expired) {
+                match self.give(sub, &owned, &mut expired) {
                     Give::Ok => count += 1,
                     Give::Stall(c) => {
                         count += 1;
@@ -296,7 +396,7 @@ impl Registry {
     }
 
     /// Build the frame, queue it, and book the delivery.
-    fn give(&self, sub: &Arc<Sub>, msg: &Msg, expired: &mut Vec<Arc<Sub>>) -> Give {
+    fn give(&self, sub: &Arc<Sub>, msg: &Msg<'_>, expired: &mut Vec<Arc<Sub>>) -> Give {
         let frame = build_frame(sub, msg);
         match sub.conn.enqueue(frame) {
             Enqueue::Ok => {
@@ -372,7 +472,7 @@ fn same(a: &Arc<Sub>, b: &Arc<Sub>) -> bool {
 /// A subscriber that did not declare header support gets the stripped form — the
 /// reference removes the block rather than the message
 /// (`client.rs::TestClientHeaderDeliverStrippedMsg`, headers.rs).
-fn build_frame(sub: &Arc<Sub>, msg: &Msg) -> Frame {
+fn build_frame(sub: &Arc<Sub>, msg: &Msg<'_>) -> Frame {
     let headers = msg.hdr > 0 && sub.conn.supports_headers();
     let body: Bytes = if msg.hdr > 0 && !headers {
         msg.body.slice(msg.hdr..)
@@ -380,26 +480,30 @@ fn build_frame(sub: &Arc<Sub>, msg: &Msg) -> Frame {
         msg.body.clone()
     };
     let total = body.len();
-    let mut head = Vec::with_capacity(32 + msg.subject.len() + sub.sid.len() * 2);
+    // "MSG " / "HMSG ", the subject, the sid, maybe a reply, one or two sizes and
+    // a CRLF. 48 covers the separators and digits with room to spare, which is
+    // cheaper than counting them.
+    let mut head =
+        Vec::with_capacity(48 + msg.subject.len() + sub.sid.len() + msg.reply.unwrap_or(&[]).len());
     if headers {
         head.extend_from_slice(b"HMSG ");
     } else {
         head.extend_from_slice(b"MSG ");
     }
-    head.extend_from_slice(&msg.subject);
+    head.extend_from_slice(msg.subject);
     head.push(b' ');
     head.extend_from_slice(&sub.sid);
-    if let Some(reply) = &msg.reply {
+    if let Some(reply) = msg.reply {
         head.push(b' ');
         head.extend_from_slice(reply);
     }
     head.push(b' ');
     if headers {
         // HMSG subject sid [reply] #hdr #total
-        head.extend_from_slice(itoa(msg.hdr).as_bytes());
+        push_u64(&mut head, msg.hdr as u64);
         head.push(b' ');
     }
-    head.extend_from_slice(itoa(total).as_bytes());
+    push_u64(&mut head, total as u64);
     head.extend_from_slice(b"\r\n");
     Frame {
         head: Bytes::from(head),
@@ -430,18 +534,18 @@ pub fn no_responder_frame(reply: &[u8], sub: &Sub, published: &[u8]) -> Frame {
     }
 }
 
-/// Small integer formatting without pulling in a dependency.
-fn itoa(n: usize) -> String {
+/// Decimal digits, straight into the buffer: the `String` this used to build was
+/// one allocation per number per delivery, and an `HMSG` line has two.
+fn push_u64(dst: &mut Vec<u8>, mut n: u64) {
     let mut buf = [0u8; 20];
     let mut i = buf.len();
-    let mut v = n as u64;
     loop {
         i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        if v == 0 {
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
             break;
         }
     }
-    String::from_utf8_lossy(&buf[i..]).into_owned()
+    dst.extend_from_slice(&buf[i..]);
 }

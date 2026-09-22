@@ -40,7 +40,11 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        count!(new_size);
+        // `count!` already moves LIVE by `new_size`, so adding it again here is
+        // how `live` once reported 545 MB on a run whose RSS never left 2.7 MB:
+        // the block being replaced was subtracted, its replacement counted twice.
+        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
         LIVE.fetch_add(new_size as u64, Ordering::Relaxed);
         LIVE.fetch_sub(layout.size() as u64, Ordering::Relaxed);
         System.realloc(ptr, layout, new_size)

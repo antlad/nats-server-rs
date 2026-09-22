@@ -8,11 +8,16 @@ of [`benchmarks/baseline-rust.md`](../benchmarks/baseline-rust.md).
 
 `perf` cannot run here: `kernel.perf_event_paranoid = 4`, no `CAP_PERFMON`, no
 passwordless sudo. So the attribution below comes from four counters that don't
-need a profiler, each taken the same way against both binaries:
+need a profiler, each taken the same way against both binaries. Two more of them
+are instruments rather than readings — `parsebench` and `memprobe` — added because
+"the server is slow" is not a question the first four can answer on their own:
 
 | What | How | Works on Go? |
 |---|---|---|
-| Server CPU seconds | `/proc/<pid>/stat` `utime+stime` before/after a bench run, divided by messages | ✅ |
+| Server CPU seconds | `/proc/<pid>/task/*/stat` `utime+stime` summed, before/after a bench run, divided by messages — the one column that does not move with the machine's mood | ✅ |
+| Parse cost alone | `cargo run --release -p nats-server-rs --example parsebench`: the same `Parser`, a 64 KiB block of pre-encoded `PUB` frames, no sockets | ours only, but the comparison holds: it is the same state machine `parser.go` runs, so what it shows is work, not luck |
+| Drain rate, client excluded | `crates/bench/src/bin/floodpub.rs` — pre-encoded frames, one blocking writer, the clock stopped by the server's `PONG`. Driven paired by `./benchmarks/run_pubonly.sh` and `run_three.sh` | ✅ |
+| Memory a wedged subscriber costs | `python3 specs/tools/memprobe.py <bin> 3000000` — one subscriber that stops reading, one publisher, peak `VmRSS` | ✅ |
 | Syscalls per message | `strace -f -c` launched as the server's parent (`ptrace_scope` blocks attaching to an already-running process) | ✅ |
 | Resident set | `/proc/<pid>/status` `VmRSS` sampled at 200 ms | ✅ |
 | Allocations per message | `--features allocstats`: a counting `GlobalAlloc` that dumps at start and shutdown to `$NATS_RS_STATS_FILE` | ❌ — the reference exposes no pprof endpoint on its monitoring port (`/debug/pprof/heap` is 404, with and without `NATS_MONITOR_PPROF=true`), so our absolute count is recorded without a Go counterpart |
@@ -44,6 +49,110 @@ write count, and it is the one item here that has no Go number to compare to.
 The earlier hypothesis list ranked "one `Vec<Bytes>` per frame" first and the
 batching rule fifth. The measurement reverses that: the coalescing cap was the
 mechanism, and the frame allocation is a per-message constant that matters less.
+
+## The publish-only path (2026-09-22): why Rust lost to Go when nobody is listening
+
+Reported from macOS with the CLI's own bench — `nats bench pub test`, one
+publisher, **no subscribers** — 2.23 M msgs/s on the reference against 1.67 M on
+ours (and 2.28 M against 1.85 M on the subscribe run). That is a path the `pubsub`
+bench never walks: with nobody interested, the server reads, parses, tests for
+interest, and writes *nothing at all*. No frame is built, no outbox is touched, no
+writer wakes up. Everything the two binaries differ by lives in the read loop, the
+parser and the routing decision.
+
+### Measuring it without the client in the way
+
+`nats bench`'s numbers mix the Go client's own CPU into the comparison — measured
+here, the client burns 1.0–1.4 cores while the server burns 0.9, so the reported
+rate is whichever of the two is slower that second, and it moves ±60 % between
+rounds of the same binary. `crates/bench/src/bin/floodpub.rs` takes the client out:
+one blocking thread, frames pre-encoded into a 256 KiB buffer, `write` until the
+kernel takes them, and the clock stopped only when a trailing `PING`/`PONG` proves
+the server consumed every byte — without that gate the loopback's 32 MB of
+auto-tuned receive slack lets the client report a rate the server never had to keep
+up with. `./benchmarks/run_pubonly.sh` drives it against both binaries inside the
+same round, server pinned to one core and the driver to another, and reports CPU
+seconds per message from `/proc/<pid>/task/*/stat`.
+
+aarch64 (Cortex-X925, server on core 7, driver on core 3), 20 M messages of 128 B:
+
+| | reference | ours, before | ours, now |
+|---|---:|---:|---:|
+| msgs/sec | 3.36 M | 1.25 M | **3.10 M** |
+| CPU µs per message | 0.297 | 0.796 | **0.320** |
+| ours / reference | — | **2.67×** | **1.08×** |
+| cores busy | 1.00 | 1.00 | 1.00 |
+| allocations per message | not measurable | 5.07 | **0.03** |
+| syscalls: `recvfrom` per message | 0.0029 | 0.0091 | 0.0022 |
+| parse alone, ns per message | — | 295 | 190 |
+
+Raw: `benchmarks/raw/2026-09-22-pubonly-baseline.txt` (before) and
+`2026-09-22-pubonly-6round.txt` (after, four-arm medians below).
+
+### One caveat the paired protocol caught, and it is not about either server
+
+Rounds 1–3 of that file read 0.297 / 0.320 above. Rounds 4–6 read 0.166 for the
+reference and 0.177 for ours — **both binaries about 1.7× faster**, in the same
+seconds, with the ratio between them unchanged (1.06×). The machine changes state
+under a sustained load like this (deep cpuidle exit cost, and the loopback's
+receive-buffer autotuning, which decides how often the reader parks at all); after
+a few minutes of it, both servers run work-only instead of work-plus-wakeups.
+This is the same placement sensitivity `benchmarks/baseline-go.md` warns about for
+latency, showing up as a throughput level. It is why every number quoted here is a
+**paired** one: an unpaired "0.177 µs/msg" from the fifth round of a warm session
+would be a third of the truth, and would not survive anyone reproducing it from a
+cold machine.
+
+Both servers were *exactly one core wide* before and after, so this was never a
+question of parallelism, of tokio against the Go runtime, or of the kernel's
+scheduler. It was 2.7× the work per message, and the work was in seven places:
+
+| What the reference does | What we did | Cost, per message |
+|---|---|---:|
+| `parser.go` jumps the index over the payload (`i = c.as + c.pa.size - LEN_CR_LF`) and slices it out of the read buffer at `MSG_END_N`; `processPub` points `c.pa.subject` into the buffer too. **Zero copies, zero allocations.** | freeze the control line, copy the subject, gather the body's pieces into a `Vec`, allocate a `BytesMut`, memcpy the payload in. | 4 allocs + 2 memcpys ≈ 130 ns |
+| `splitArg` writes into a stack array, deliberately: *"Unroll splitArgs to avoid runtime/heap issues"* (`go:client.go:2973`) | `split_args` returned a `Vec<&[u8]>` | 1 alloc ≈ 30 ns |
+| `OP_START` switches on the first byte, so `PUB` is two branches deep | eight prefix/token comparisons before `PUB` matched | ≈ 15 ns |
+| the CONNECT options are plain fields, read under the one lock the client already holds | `Mutex<Options>`, read three times per publish, plus a `Mutex<Weak<Conn>>` upgrade for an `Arc` the caller was already holding | 4 lock pairs ≈ 90 ns |
+| `acc.sl` is hashed with the runtime's seeded `memhash`, ~5 ns for a short subject | `SipHash-1-3` ≈ 18 ns | ≈ 13 ns |
+| "Check for no interest, short circuit if so" (`go:client.go:4506`), after a per-client L1 result cache (`c.in.results`, keyed by subject, invalidated by the sublist `genid`) | a process-wide `Mutex<Registry>`, a hash probe and an RNG draw, every message, whether or not anyone is listening | ≈ 50 ns |
+| the read buffer starts at 512 B and doubles to 64 KiB while reads come back full (`go:client.go:110`, `:1675`) | a fixed 16 KiB | 3× the syscalls |
+
+Changes [3](#3--the-parser-stopped-copying-and-stopped-allocating-keeper) through
+[7](#7--the-read-buffer-grows-like-the-references-keeper) are those seven, one at a
+time, each with a paired run and the ordering proof after it. The steps, in the
+order they were measured, are cumulative — each is the build at that point,
+against the reference in the same round, cold-session regime:
+
+| After | CPU µs per message | vs the reference |
+|---|---:|---:|
+| (nothing) | 0.796 | 2.67× |
+| change 3 — parser views, no arg `Vec`, first-byte dispatch | 0.530 | 1.77× |
+| changes 4, 5 — options atomic word, no `self_ref`, seeded subject hash | 0.384 | 1.28× |
+| changes 6, 7, 9 — no-interest short circuit, borrowed `Msg`, 64 KiB reads, reused batch | 0.320 | 1.08× |
+
+All three arms in one session (`./benchmarks/run_three.sh MODE=pubonly`, 20 M
+messages, server on core 7, driver on core 3, three rounds — µs of server CPU per
+message). The point of the third column is that the *old* build did not get faster
+when the machine warmed up, and the new one does, exactly like the reference: the
+work per message stopped being the story.
+
+| Round | old build | reference | new build | new / reference |
+|---|---:|---:|---:|---:|
+| 1 (cold) | 0.791 | 0.297 | 0.317 | 1.07× |
+| 2 | 0.671 | 0.174 | 0.183 | 1.05× |
+| 3 | 0.444 | 0.171 | 0.183 | 1.07× |
+
+`benchmarks/raw/2026-09-22-pubonly-threearm.txt`.
+
+**What is left is 23 ns, and it has a name.** The reference answers a publish that
+nobody wants from a per-client cache keyed by subject: one map probe for the
+thousandth message to `test`, because the interest list never changed. We match —
+and hash — every message. That is item 5 in "where the gap stands" below. It is
+the only structural difference left on this path, and at 0.320 µs against 0.297 it
+is no longer the interesting part of the comparison: **the publish-only server is
+no longer the reason a publish benchmark looks slower in Rust than in Go.** What
+was, was five allocations, four mutexes, a SipHash and a 16 KiB buffer, and every
+one of them was ours to fix.
 
 ## Changes
 
@@ -120,7 +229,136 @@ Perf effect: none measurable — one relaxed load on a path that already took a
 mutex. It is in this file because it changed the throughput samples' *reliability*,
 which is the thing the medians were hiding.
 
+### 3 — the parser stopped copying, and stopped allocating (keeper)
+
+`PUB` used to cost four allocations a message: the argument list (`split_args`
+returned a `Vec`), a copy of the subject, a `Vec` to hold the body's pieces, and a
+fresh `BytesMut` the payload was memcpy'd into. Now the body is a *view* of the
+read buffer (`Parts`), the subject and reply are views of the control line
+(`Args::view`, ranges into the frozen line instead of copies), the argument list is
+a stack array (`Args`, saturating at "too many"), and the verbs are dispatched on
+their first byte the way `OP_START` does it instead of through eight prefix
+comparisons.
+
+| Counter | Before | After |
+|---|---:|---:|
+| allocations per message, publish-only | 5.07 | **0.03** |
+| bytes allocated per message | 775 | 130 |
+| parse-only ns per message (`examples/parsebench`) | 295 | 190 |
+| pubonly CPU µs per message | 0.796 | 0.530 |
+
+Views are also what makes the *no-interest* case free (change 6): skipping a
+payload costs nothing when skipping means "do not take a reference".
+
+### 4 — CONNECT's flags became one atomic word; the hot path stopped cloning `Arc`s through a mutex (keeper)
+
+`Conn::opts()` took a `Mutex` and cloned. Three reads per published message
+(`verbose`, then the publish arm's `opts`, then the no-responder check) plus a
+`Mutex<Weak<Conn>>` upgrade to get an `Arc` the caller already held. The five flags
+are now packed (`Options::pack`) into an `AtomicU64` — one writer, the connection's
+own reader task, and many lock-free readers on the routing path — and `handle` uses
+the `Arc<Conn>` it was given.
+
+### 5 — a subject hash that costs what a subject costs (keeper)
+
+`HashMap<Bytes, _>` with the default `RandomState` spends 15–20 ns of SipHash-1-3
+on a four-byte subject, once per message, to defend against a collision attack
+that this map has always been open to anyway (subjects are client-chosen). Now:
+multiply-xor over 8-byte words, seeded once per process the same way
+`RandomState` seeds, so the buckets are still not predictable from outside.
+Equality — which is what defines the protocol's behaviour here — is untouched.
+
+### 6 — "check for no interest, short circuit if so" (keeper)
+
+The reference's own comment (`go:client.go:4506`). `route` now returns the moment
+the match comes up empty: no `Msg` to build, no RNG draw, no second lock, no
+payload to look at. The RNG is now consulted only when a queue group is actually
+in the batch, and the registry lock is taken once per message instead of a second
+time for expired subscriptions.
+
+`Msg` became borrowed (`&'a [u8]` subject/reply, `&'a Bytes` body) because routing
+only needs to *look*: the copy a delivery needs is taken once, in `route`, and only
+when somebody is going to write those bytes. That keeps a slow subscriber from
+pinning the publisher's 64 KiB read chunk — `specs/tools/memprobe.py` checks it,
+and holds 1.95× `max_pending` in this build against the reference's 1.62×.
+
+### 7 — the read buffer grows, like the reference's (keeper)
+
+`startBufSize` 512 B doubling to `maxBufSize` 64 KiB whenever a read comes back
+full, halving after `shortsToShrink` short ones (`go:client.go:110-112`,
+`:1675-1685`), implemented in `read_loop` with the same rules. Syscalls per message
+went from 0.0091 (1 per 110) toward the reference's 0.0029 (1 per 344); what it
+buys directly is ~10 ns, and what it buys indirectly is that a 64 KiB read holds a
+batch of ~450 events, which is what made change 9's `feed_into` worth doing at all.
+
+The events batch itself is now the reader's, not the allocator's
+(`Parser::feed_into`, the caller's `Vec` reused) — a 47 KiB `Vec<Event>` handed
+back and re-fetched every read meant every batch was written into cold pages.
+
+### 8 — Nagle was on (keeper, parity)
+
+Nothing in the protocol tests can see this one. The reference never calls
+`SetNoDelay` because it does not have to: Go's `net` sets `TCP_NODELAY` on every
+connection it hands out. `strace -e trace=setsockopt` on the two servers says it
+plainly — the reference: `setsockopt(fd, SOL_TCP, TCP_NODELAY, [1], 4)`; ours,
+before: no such line at all. Accepted sockets now get `set_nodelay(true)` in
+`net::accept_loop` before anything can be written to them.
+
+### 9 — frame digits and frame parts (keeper, delivery path)
+
+`build_frame` wrote its sizes through a `String` and the writer collected each
+frame's buffers into a fresh `Vec<Bytes>` per frame — one allocation each, on the
+delivery path only. Digits now go straight into the head buffer (`push_u64`) and
+`Frame::write_into` moves its three buffers into the writer's own queue.
+
+## The delivery path, same treatment (2026-09-22)
+
+The subscribe half of the user's report (`nats bench sub`: 2.28 M against 1.85 M)
+is a different path — one publisher, one subscriber, and the message has to leave
+through a second connection. Same three-arm protocol, `pubsub` bench, 3 M messages
+of 256 B, server pinned, client not (`benchmarks/raw/2026-09-22-pubsub-threearm.txt`):
+
+| Round | old build | reference | new build | new / reference |
+|---|---:|---:|---:|---:|
+| 1 | 2.317 | 1.477 | 1.953 | 1.32× |
+| 2 | 2.453 | 1.487 | 1.980 | 1.33× |
+| 3 | 2.200 | 1.367 | 1.893 | 1.38× |
+
+So the changes moved the delivery path too (0.85× the old build's CPU per
+message), but it is **not** at parity: 1.3× the reference's CPU per delivered
+message, against 1.07× on the publish path. Neither server is CPU-saturated in
+this bench (0.4–0.8 cores) — the async-nats client is the limit on throughput, so
+only the CPU column means anything.
+
+What the delivery path still spends that the reference does not, with the counters
+that say so:
+
+* **5.02 allocations per delivered message** on the current build (`allocstats`),
+  against 0.03 on the publish path. Three are per message — the `Vec` that `route`
+  collects matches into, the `Vec` that becomes the `MSG` head line, and the payload
+  copy the copy-on-deliver rule asks for (change 6, and `memprobe.py` is what pays
+  for it) — and two are per *write*, which in this bench is per message because
+  deliveries arrive one at a time: the `Vec<IoSlice>` built for `writev`, and the
+  `Sleep` that `tokio::time::timeout` constructs for every write attempt.
+* **One task hop and one wake-up per batch.** The reference appends the frame to
+  the subscriber's outbound buffers from the *producer's* thread and, when the
+  subscriber's writer is idle, flushes it there and then within a budget
+  (`flushClients`, `go:client.go:1431`) — no channel, no wake-up. Our model is a
+  queue plus a writer task, which is what makes the ordering promise and the
+  bounded-bytes outbox easy to reason about, and costs a `futex` on the way.
+* The fanout numbers in `benchmarks/baseline-rust.md` say the width scales better
+  than the reference's (0.49× its CPU per delivery at 3 cores against 7), so this
+  is a one-subscriber story, not a scalability story.
+
+The next experiment here is the two per-write allocations, and after that the flush
+inline/out of the writer task — in that order, each with a three-arm run.
+
 ## Where the pubsub gap stands now
+
+This section is about the *delivery* path; the publish-only path that started this
+round of work is measured in "The publish-only path" and "The delivery path, same
+treatment" above, where the honest summary is 1.07× on the former and 1.3× on the
+latter.
 
 Two numbers, depending on how it is asked. On the canonical unpinned protocol
 (16 paired rounds, [`baseline-rust.md`](../benchmarks/baseline-rust.md)) the
@@ -132,33 +370,44 @@ machine was doing at the moment of the sample, and both are in the raw logs.
 
 What is left, ranked by the counters rather than by guesswork:
 
-1. **Per-message user-space work.** 11.08 allocations and 1,104 bytes per message
-   on the final build, against 256 bytes of payload — 4.3× the bytes moved. Two
-   named sites: `Frame::parts()` allocates a `Vec<Bytes>` per frame per
-   subscriber (three clones into a fresh vector, when the writer could take them
-   straight into its own), and `itoa()` in `build_frame` returns a `String` for
-   the numbers in the head line. Next experiment, in that order, each with an
-   `allocstats` count and a paired three-arm run: fill a reusable part list
-   (expect roughly −1 alloc and −56 B per message), then write the digits into the
-   head buffer (expect −1 alloc, −32 B).
-   Caveat that the counters themselves impose: the `allocstats` build costs 2.4×
-   the CPU of the plain one (8.32 µs/msg against 3.42 for the same run), so its
-   numbers answer "how many", never "how fast".
-2. **Read side.** 1 `recvfrom` per 75 messages against the reference's 1 per 205,
-   and we have not changed it. Unexamined: whether our reader's buffer growth
-   policy is the reason, and how many bytes the client actually hands us per
-   segment. Measure: bytes per `recvfrom` in both, from the same `strace -e
-   trace=read,recvfrom -T` run.
+1. **Per-message user-space work.** Mostly paid for on the publish path
+   (0.03 allocations a message, change 3) and still open on the delivery path:
+   **5.02 allocations and 499 bytes per delivered message** on the current build.
+   Three of the five are named and cheap — the `Vec` that `route` collects matched
+   subscriptions into (one per message when a subject has subscribers), the
+   `Vec` that becomes the `MSG` head line, and the payload copy `route` takes on
+   purpose (change 6). The other two are per *write*, not per message, and only
+   appear when deliveries arrive one at a time: the `Vec<IoSlice>` collected for
+   each `writev`, and the `Sleep` that `tokio::time::timeout` builds for every
+   write attempt. A batch of 3 buffers should not need an allocation to describe
+   itself to the kernel, and the deadline should not need a new timer for a write
+   that completes in one syscall.
+2. **Read side.** Settled by change 7: the buffer grows to 64 KiB the way the
+   reference's does, and the publish path went from 1 `recvfrom` per 110 messages
+   to per ~450.
 3. **Wake-ups.** Settled, and no longer a suspect: 0.0042 `futex` per message
    against the reference's 0.014, after change 1.
-4. **Registry lock.** Not on this path — one publisher, one subscriber, ~1 core
-   busy in each binary, and the fanout numbers (0.37× the CPU per delivery of the
-   reference, 3 cores against 7) say the width scales better than the reference's
-   does. Untested, lowest priority, and it would take a contention counter to test.
+4. **Registry lock.** Still taken once per message, and it is a *process*-wide
+   lock: the publish-only path now avoids it entirely when nothing matched
+   (change 6 — with no subscriptions at all it is never touched), but a message
+   that reaches someone takes it, and so does every subscribe/unsubscribe. With
+   one publisher and one subscriber that is invisible (change 6's measurement:
+   the lock costs ~25 ns uncontended, and the whole publish costs 320). Untested
+   at width beyond the fanout numbers in `benchmarks/baseline-rust.md`, which say
+   the width scales better than the reference's does.
+5. **The reference has an L1 cache the publish path does not.** `c.in.results` is
+   a per-client map of subject → `SublistResult`, invalidated by the sublist
+   `genid`, so a publisher that publishes to the same subject a million times
+   resolves the interest list *once*. We match per message. It is the one
+   structural difference left on this path, and the one the counters cannot
+   explain away: we are at 320 ns against its 297.
 
-There is no measurement that explains the remaining 40 % CPU-per-message gap on
-the single-stream path yet; item 1 is the honest next experiment and Part 3's
-first bench task should start there rather than with any restructuring.
+Item 1 is still the honest next experiment for the delivery path, and the two
+per-write allocations named there are the cheapest thing in it: an `IoSlice` array
+on the stack for a small batch, and a deadline armed per batch instead of per write
+attempt. Both need the `pubsub` three-arm protocol before and after, because the
+`pubsub` *rate* is set by the client and moves ±60 % between rounds of the same
+binary; the CPU column is the one that can be believed.
 
 ## Rule
 

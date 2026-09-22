@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
@@ -73,18 +73,20 @@ impl Frame {
         self.head.len() + self.body.as_ref().map(|b| b.len()).unwrap_or(0) + self.tail.len()
     }
 
-    fn parts(&self) -> Vec<Bytes> {
-        let mut v = Vec::with_capacity(3);
-        if !self.head.is_empty() {
-            v.push(self.head.clone());
+    /// Hand this frame's buffers to the writer's list, in order, by moving them:
+    /// returning a fresh `Vec<Bytes>` (and cloning into it) was one allocation
+    /// per frame per subscriber, which is a cost paid on every delivery.
+    fn write_into(self, dst: &mut VecDeque<Bytes>) {
+        let Frame { head, body, tail } = self;
+        if !head.is_empty() {
+            dst.push_back(head);
         }
-        if let Some(b) = &self.body {
-            v.push(b.clone());
+        if let Some(b) = body {
+            dst.push_back(b);
         }
-        if !self.tail.is_empty() {
-            v.push(self.tail.clone());
+        if !tail.is_empty() {
+            dst.push_back(tail);
         }
-        v
     }
 }
 
@@ -105,7 +107,7 @@ pub enum Enqueue {
 /// reference seeds before unmarshalling (`defaultOpts`, `go:client.go:710`). A
 /// plain `#[serde(default)]` would make them false and quietly break
 /// self-delivery and every `+OK`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Options {
     pub verbose: bool,
     pub pedantic: bool,
@@ -127,6 +129,29 @@ impl Default for Options {
 }
 
 impl Options {
+    /// The five flags as one word, because `Conn` keeps them in an atomic: every
+    /// other connection reads them while it routes (`echo`, `headers`), and a
+    /// `Mutex<Options>` there cost an uncontended lock pair per read — three
+    /// reads per published message, which is real time at a million messages a
+    /// second. The word is written only by the connection's own reader task.
+    fn pack(&self) -> u64 {
+        (self.verbose as u64)
+            | (self.pedantic as u64) << 1
+            | (self.echo as u64) << 2
+            | (self.headers as u64) << 3
+            | (self.no_responders as u64) << 4
+    }
+
+    fn unpack(word: u64) -> Options {
+        Options {
+            verbose: word & 1 != 0,
+            pedantic: word & 2 != 0,
+            echo: word & 4 != 0,
+            headers: word & 8 != 0,
+            no_responders: word & 16 != 0,
+        }
+    }
+
     /// Apply one CONNECT object. Unknown keys (`lang`, `version`, `protocol`,
     /// `name`, …) are ignored, and a key that is absent keeps its current value —
     /// which is what makes a second CONNECT behave the way it was measured to.
@@ -274,7 +299,8 @@ pub struct Conn {
     pub peer: SocketAddr,
     pub server: Arc<Server>,
     pub out: Arc<Outbox>,
-    opts: Mutex<Options>,
+    /// CONNECT's flags, packed; see `Options::pack`.
+    flags: AtomicU64,
     subs: Mutex<HashMap<Bytes, Arc<Sub>>>,
     closed: AtomicBool,
     reason: Mutex<Option<String>>,
@@ -288,15 +314,20 @@ pub struct Conn {
 
 impl Conn {
     pub fn opts(&self) -> Options {
-        self.opts.lock().unwrap().clone()
+        Options::unpack(self.flags.load(Ordering::Acquire))
+    }
+
+    /// Only the connection's own reader task calls this.
+    fn set_opts(&self, opts: Options) {
+        self.flags.store(opts.pack(), Ordering::Release);
     }
 
     pub fn echo(&self) -> bool {
-        self.opts.lock().unwrap().echo
+        self.flags.load(Ordering::Acquire) & 4 != 0
     }
 
     pub fn supports_headers(&self) -> bool {
-        self.opts.lock().unwrap().headers
+        self.flags.load(Ordering::Acquire) & 8 != 0
     }
 
     pub fn is_closed(&self) -> bool {
@@ -348,10 +379,7 @@ impl Conn {
             // harness pipes stderr into the void.
             eprintln!(
                 "[{}] [{:>5}] cid={} closing: {}",
-                self.server.server_name,
-                "DEBUG",
-                self.cid,
-                reason
+                self.server.server_name, "DEBUG", self.cid, reason
             );
         }
         *self.reason.lock().unwrap() = Some(reason);
@@ -377,7 +405,6 @@ impl Conn {
     pub fn note_pong(&self) {
         self.pings_out.store(0, Ordering::Relaxed);
     }
-
 }
 
 /// Spawn the two tasks for an accepted connection. The INFO line is queued before
@@ -394,7 +421,7 @@ pub async fn spawn(server: Arc<Server>, socket: TcpStream, cid: u64) {
         peer,
         server: server.clone(),
         out: out.clone(),
-        opts: Mutex::new(Options::default()),
+        flags: AtomicU64::new(Options::default().pack()),
         subs: Mutex::new(HashMap::new()),
         closed: AtomicBool::new(false),
         reason: Mutex::new(None),
@@ -414,7 +441,10 @@ pub async fn spawn(server: Arc<Server>, socket: TcpStream, cid: u64) {
     // Reading is done: no more commands, and everything they queued is in the
     // writer's hands. Closing the sender lets it flush and finish.
     *out.tx.lock().unwrap() = None;
-    if tokio::time::timeout(Duration::from_secs(10), writer).await.is_err() {
+    if tokio::time::timeout(Duration::from_secs(10), writer)
+        .await
+        .is_err()
+    {
         // The write deadline is the real timer; this is only the backstop that
         // keeps a wedged socket from leaking the task.
         conn.close_now("write deadline");
@@ -438,8 +468,26 @@ fn hard_closed(conn: &Conn) -> bool {
 
 // ------------------------------------------------------------------ reader ---
 
+/// The per-connection read buffer, and how it moves.
+///
+/// The reference starts at 512 B and doubles whenever a read came back full, to
+/// 64 KiB (`go:client.go:110-112`, `:1675-1685`), shrinking again when reads stop
+/// filling it. It matters because one `recvfrom` per 110 messages is three times
+/// as many syscalls as one per 344, and every one of them copies the same bytes
+/// a bigger buffer would have taken in a single go.
+const START_READ_BUF: usize = 16 * 1024;
+const MAX_READ_BUF: usize = 64 * 1024;
+/// Consecutive short reads before the buffer halves, as in the reference's
+/// `shortsToShrink`.
+const SHORTS_TO_SHRINK: u32 = 2;
+
 async fn read_loop(server: Arc<Server>, conn: Arc<Conn>, mut read: OwnedReadHalf) {
-    let mut buf = BytesMut::with_capacity(16 * 1024);
+    let mut cap = START_READ_BUF;
+    let mut short = 0u32;
+    let mut buf = BytesMut::with_capacity(cap);
+    // The batch this read produced. Reused, so a connection's events live in the
+    // same pages read after read (`proto::Parser::feed_into`).
+    let mut events: Vec<Event> = Vec::new();
     let mut parser = Parser::new();
     // The first probe is short whatever is configured; afterwards, the interval.
     let first = keepalive_first(server.cfg.ping_interval);
@@ -453,8 +501,12 @@ async fn read_loop(server: Arc<Server>, conn: Arc<Conn>, mut read: OwnedReadHalf
         if conn.is_closed() {
             break;
         }
-        if buf.capacity() - buf.len() < 8 * 1024 {
-            buf.reserve(16 * 1024);
+        if buf.remaining_mut() < cap {
+            // `reserve` reuses the allocation in place when nothing still holds a
+            // view of it, which — with the batch's views dropped below — is the
+            // normal case: the reader's buffer is then one allocation for the
+            // life of the connection.
+            buf.reserve(cap - buf.remaining_mut());
         }
         let step = tokio::select! {
             r = read.read_buf(&mut buf) => Some(r),
@@ -484,23 +536,40 @@ async fn read_loop(server: Arc<Server>, conn: Arc<Conn>, mut read: OwnedReadHalf
             conn.close("client closed");
             break;
         }
+        // Grow on a full read, shrink after enough short ones.
+        if n >= cap {
+            short = 0;
+            cap = (cap * 2).min(MAX_READ_BUF);
+        } else if n < cap / 2 {
+            short += 1;
+            if short > SHORTS_TO_SHRINK && cap > START_READ_BUF {
+                short = 0;
+                cap /= 2;
+                if buf.is_empty() {
+                    buf = BytesMut::with_capacity(cap);
+                }
+            }
+        }
 
         let lim = limits_of(&server);
-        let events = match parser.feed(&mut buf, &lim) {
-            Ok(events) => events,
-            Err(err) => {
-                if let Some(text) = err.err_line() {
-                    conn.enqueue(Frame::err(text));
-                }
-                if err.closes() {
-                    conn.close(format!("protocol error: {err:?}"));
-                    break;
-                }
-                // Class B: said its piece, still serving.
-                continue;
+        // Parse the whole segment first, then run its operations in order: a
+        // parse error that follows good commands in the same read belongs to the
+        // reference's "the connection is gone, say this one thing" class, and
+        // what the earlier commands did before the close is measured parity
+        // (`specs/parity-log.md`), so the batch is not dispatched as it fills.
+        events.clear();
+        if let Err(err) = parser.feed_into(&mut buf, &lim, &mut events) {
+            if let Some(text) = err.err_line() {
+                conn.enqueue(Frame::err(text));
             }
-        };
-        for ev in events {
+            if err.closes() {
+                conn.close(format!("protocol error: {err:?}"));
+                break;
+            }
+            // Class B: said its piece, still serving.
+            continue;
+        }
+        for ev in events.drain(..) {
             if !handle(&server, &conn, ev).await {
                 conn.close("connection closed by protocol");
                 return;
@@ -531,10 +600,8 @@ async fn handle(server: &Arc<Server>, conn: &Arc<Conn>, ev: Event) -> bool {
     let verbose = conn.opts().verbose;
     match ev {
         Event::Connect(json) => {
-            let ok = {
-                let mut opts = conn.opts.lock().unwrap();
-                opts.apply_connect(&json)
-            };
+            let mut opts = conn.opts();
+            let ok = opts.apply_connect(&json);
             if !ok {
                 // Go cannot unmarshal the options: the connection is done, and it
                 // says nothing.
@@ -542,13 +609,20 @@ async fn handle(server: &Arc<Server>, conn: &Arc<Conn>, ev: Event) -> bool {
             }
             // The verbose value that applies *after* the parse governs this line
             // (measured; contract §5).
-            if conn.opts().verbose {
+            conn.set_opts(opts);
+            if opts.verbose {
                 conn.enqueue(Frame::ok());
             }
         }
-        Event::Subscribe { subject, queue, sid } => {
+        Event::Subscribe {
+            subject,
+            queue,
+            sid,
+        } => {
             if !crate::subjects::is_valid(&subject)
-                || queue.as_ref().is_some_and(|q| !crate::subjects::is_valid(q))
+                || queue
+                    .as_ref()
+                    .is_some_and(|q| !crate::subjects::is_valid(q))
             {
                 server.send_err(conn, proto::INVALID_SUBJECT);
                 return true;
@@ -557,8 +631,7 @@ async fn handle(server: &Arc<Server>, conn: &Arc<Conn>, ev: Event) -> bool {
             // Re-using an sid keeps the original subscription and ignores the new
             // one, whichever filter it carried (contract §3).
             if !known {
-                let me = conn.self_ref.lock().unwrap().upgrade().expect("alive");
-                let sub = Sub::new(subject, queue, sid.clone(), me);
+                let sub = Sub::new(subject, queue, sid.clone(), conn.clone());
                 if server.registry.insert(sub.clone()) {
                     conn.subs.lock().unwrap().insert(sid, sub);
                 }
@@ -606,15 +679,16 @@ async fn handle(server: &Arc<Server>, conn: &Arc<Conn>, ev: Event) -> bool {
                 // Nothing can match an empty subject and the reference drops it.
                 return true;
             }
-            let me = conn.self_ref.lock().unwrap().upgrade().expect("alive");
+            // Borrowed, not cloned: routing looks at these bytes and the only
+            // copy worth making is the one it takes when someone takes delivery.
             let msg = Msg {
-                subject: subject.clone(),
-                reply: reply.clone(),
+                subject: &subject,
+                reply: reply.as_deref(),
                 hdr,
-                body,
+                body: &body,
             };
-            let outcome = server.registry.route(&msg, &me);
-            server.no_responder_check(&me, &msg, reply.as_ref(), outcome.count);
+            let outcome = server.registry.route(&msg, conn);
+            server.no_responder_check(conn, &msg, reply.as_deref(), outcome.count);
             for stalled in outcome.stall {
                 // The publisher waits for room on the subscriber it overflowed,
                 // and only ever on its own task: that is what keeps ordering while
@@ -701,10 +775,10 @@ async fn write_loop(out: Arc<Outbox>, mut write: OwnedWriteHalf, conn: Arc<Conn>
                 frame = rx.recv() => match frame {
                     Some(frame) => {
                         batch_bytes += frame.len();
-                        parts.extend(frame.parts());
+                        frame.write_into(&mut parts);
                         while let Ok(frame) = rx.try_recv() {
                             batch_bytes += frame.len();
-                            parts.extend(frame.parts());
+                            frame.write_into(&mut parts);
                             if parts.len() >= MAX_BATCH_PARTS || batch_bytes >= MAX_BATCH_BYTES {
                                 break;
                             }

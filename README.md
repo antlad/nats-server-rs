@@ -11,7 +11,7 @@ difference is written down and measured
 ```
 crates/harness    nats-test-harness: spawn / readiness / teardown, config files
 crates/core-it    integration tests (wire protocol, verbs, headers, lifecycle, client)
-crates/bench      pubsub / latency / fanout benchmark binaries
+crates/bench      pubsub / latency / fanout / floodpub benchmark binaries
 crates/server     the Rust server: bin nats-server-rs + lib for unit tests
 specs             measured contract, Go-suite audit, parity log, perf notes
 benchmarks        recorded baselines (Go and Rust, same protocol)
@@ -59,7 +59,7 @@ The suite is binary-agnostic on purpose: 96 tests drive a server from outside an
 pass unchanged against both binaries; the 33 in-process tests
 (`crates/server/tests/`) cover what a socket cannot see — the parser's arity
 table, the subject grammar, the INFO/CONNECT defaults, and the two ordering
-promises. 131 in total, plus a 206-case differential corpus
+promises. 135 in total, plus a 206-case differential corpus
 (`specs/tools/difffuzz.py`) that diffs the two binaries directly.
 
 - `wire.rs` — raw TCP bytes: INFO fields and key set, CONNECT/PING/PONG, `+OK`,
@@ -81,6 +81,20 @@ promises. 131 in total, plus a 206-case differential corpus
 cargo run --release -p nats-bench --bin pubsub     # MSGS, SIZE
 cargo run --release -p nats-bench --bin latency    # ITERS, WARMUP
 cargo run --release -p nats-bench --bin fanout     # MSGS, SIZE, SUBSCRIBERS
+cargo run --release -p nats-bench --bin floodpub   # ADDR, MSGS, SIZE: the drain rate
+```
+
+`floodpub` is the odd one: one connection publishing with **no subscribers**,
+which is a completely different server path from `pubsub` — nothing is written
+back, so it measures read, parse and the interest test and nothing else. It pre-
+encodes the frames and stops the clock only when a trailing `PING`/`PONG` proves
+the server consumed every byte, so the number is the server's drain rate and not
+the client's own cost. Compare it against the reference, paired inside each round:
+
+```sh
+MSGS=20000000 ROUNDS=4 PIN=7 CLIENT_PIN=3 ./benchmarks/run_pubonly.sh      # CPU-bound
+NATS_CLI=nats CLIENT=nats MSGS=10000000 ROUNDS=3 ./benchmarks/run_pubonly.sh  # what `nats bench pub` sees
+CLIENT=sub NATS_CLI=nats ./benchmarks/run_pubonly.sh                      # the delivery path
 ```
 
 Each prints one stable `bench name=... key=value` line. For a comparison that
@@ -113,6 +127,15 @@ this host: `kernel.perf_event_paranoid = 4`, no `CAP_PERFMON`). Those counters
 need a server that outlives the bench run, which is what `NATS_BENCH_URL` is
 for: set it and the bench drives an already-running server instead of spawning
 one. Leave it unset — every test and every recorded baseline does.
+
+Three probes go with it, because "where does the time go" needs a smaller
+question to ask:
+
+```sh
+cargo run --release -p nats-server-rs --example parsebench          # the parser alone, no sockets
+cargo run --release -p nats-server-rs --features allocstats --example parsebench   # …and allocations per message
+python3 specs/tools/memprobe.py target/release/nats-server-rs       # what a wedged subscriber costs the server in RAM
+```
 
 ## Status and limitations
 

@@ -23,8 +23,6 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-use bytes::Bytes;
-
 pub use config::Config;
 pub use nuid::Rng;
 pub use routing::Registry;
@@ -98,19 +96,18 @@ impl Server {
     pub fn no_responder_check(
         &self,
         conn: &Arc<client::Conn>,
-        msg: &routing::Msg,
-        reply: Option<&Bytes>,
+        msg: &routing::Msg<'_>,
+        reply: Option<&[u8]>,
         delivered: usize,
     ) {
         if delivered != 0 || !conn.opts().no_responders {
             return;
         }
-        let reply = match reply {
-            Some(r) if !r.is_empty() => r.clone(),
-            _ => return,
+        let Some(reply) = reply.filter(|r| !r.is_empty()) else {
+            return;
         };
         for sub in self.registry.matching_of(conn, &reply) {
-            conn.enqueue(routing::no_responder_frame(&reply, &sub, &msg.subject));
+            conn.enqueue(routing::no_responder_frame(reply, &sub, msg.subject));
         }
     }
 }

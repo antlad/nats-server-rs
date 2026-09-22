@@ -36,6 +36,17 @@ async fn accept_loop(server: Arc<Server>, listener: TcpListener) {
     loop {
         match listener.accept().await {
             Ok((socket, _peer)) => {
+                // Nagle off, before anything can be written. The reference never
+                // calls SetNoDelay because it does not need to: Go's `net` sets
+                // TCP_NODELAY on every TCP connection it hands out, so every byte
+                // this server says — an `MSG` to a subscriber, an `-ERR` — leaves
+                // immediately. Left at the kernel default we wait for an ACK
+                // instead, and that is a latency difference the protocol tests
+                // cannot see.
+                if socket.set_nodelay(true).is_err() {
+                    drop(socket);
+                    continue;
+                }
                 let server = server.clone();
                 if server.cfg.max_connections >= 0
                     && server.active.load(std::sync::atomic::Ordering::Relaxed)
